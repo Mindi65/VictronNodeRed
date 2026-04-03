@@ -1,0 +1,450 @@
+// Energetikos valdymo modulis - Versija 1.7.8
+// Versija 1.7.3a - Pakeitimai nuo 1.7.2:
+// 1. Proactive MAX CHARGE: SolarTodayRemaining<max(2,BattPot×2)+weak forecast→100%
+// 2. isCloudyTomorrow → 100%
+// Versija 1.7.3b: proactiveThreshold max(5→6)
+// Versija 1.7.3c: shadowCorrection -5kWh; threshold max(6→2)
+// Versija 1.7.3d: dynamic shadowCorrectionKWh from flow, fallback 3kWh
+// Versija 1.7.3e: Cloudy→Sunny only if SolarTodayRemaining>BattPot
+// Versija 1.7.4: netSolarRemaining=(solarTodayRemaining-consumptionUntilSunset)<BattPot×1.2→100%
+// Versija 1.7.5: BUGFIX - else-if blocked isCloudyTomorrow and Sunday when solarTodayRemaining>0
+// Versija 1.7.6: shadowCorrection=max(5,SolarTodayRemaining×(1-correctionFactor)) realtime
+// Versija 1.7.7: MPPT throttling detection+relief. Detect: SOC>=100, SungrowW>500, any MPPT=0.
+//   Increase +100W/2sec up to SungrowW. Decrease -100W/10sec. Reset when SOC<100.
+// Versija 1.7.8 - Pakeitimai nuo 1.7.7:
+// 1. Pridėtas avgCorrectionFactor (paskutinių 3 valandų vidurkis)
+//    - shadowCorrection naudoja avgCorrectionFactor (stabilesnis, atspindi tendenciją)
+//    - adjustedBuffer naudoja avgCorrectionFactor
+//    - Cloudy→Sunny ir 14h Targeting išlieka su momentine correctionFactor reikšme
+
+let msg1 = {};
+let debug = {};
+
+// === 1. ĮVESTIES DUOMENYS IŠ NODE-RED FLOW KONTEKSTO ===
+let reservedPowerLimit = 0;
+let TotalMPPTOutput = flow.get("MPPT") || 0;
+let SolarTotalForecastToday = flow.get("SolarTotalForecastToday") || 0;
+let SOC = flow.get("SOC") || 0;
+let DCW = flow.get("DCW") || 0;
+let DC = flow.get("DC") || 52;
+let BattPot = flow.get("BattPot") || 0;
+let GLimit = flow.get("GLimit") || 13600;
+let ACC = flow.get("ACC") || 0;
+let BPW = flow.get("BPW") || 0;
+
+// --- Laiko Kintamieji ---
+let currentHour = new Date().getHours();
+let currentMinutes = new Date().getMinutes();
+const currentMonth = new Date().getMonth();
+const dayOfWeekNow = new Date().getDay();
+
+// --- Planavimo Modulių Duomenys ---
+const rawBuffer = flow.get("ForecasterBufferkWh");
+let ForecasterBufferkWh = (rawBuffer === null || rawBuffer === undefined) ? -9999 : rawBuffer;
+let correctionFactor = flow.get("CorrectionFactor") || 1;
+let isCloudyTomorrow = flow.get("isCloudyTomorrow") || false;
+let dayThreshold = flow.get("dynamicDayThreshold") || 40;
+let sunsetHour = flow.get("dynamicSunsetHour") || 18;
+let afternoonStartHour = flow.get("dynamicAfternoonStartHour") || 16;
+let targetSOC_at_14 = flow.get("targetSOC_at_14") || 90;
+let targetSOC_at_16 = flow.get("targetSOC_at_16") || 90;
+let netEnergyForecast_17_18_Wh = flow.get("netEnergyForecast_17_18_Wh") || 9999;
+let netEnergyForecast_18_19_Wh = flow.get("netEnergyForecast_18_19_Wh") || 9999;
+
+// [1.7.8] avgCorrectionFactor – paskutinių 3 valandų vidurkis
+var dailyFactors = flow.get("dailyCorrectionFactors") || [];
+var recentFactors = dailyFactors.slice(-3);
+var avgCorrectionFactor = recentFactors.length > 0
+    ? recentFactors.reduce(function(a, b) { return a + b; }, 0) / recentFactors.length
+    : correctionFactor;
+
+// [1.7.7] MPPT throttlingo kintamieji
+var mppt1W = flow.get("MPPT1W") || 0;
+var mppt2W = flow.get("MPPT2W") || 0;
+var mppt3W = flow.get("MPPT3W") || 0;
+var SungrowW = flow.get("SungrowW") || 0;
+var throttleExport = flow.get("throttleExtraExport") || 0;
+var lastThrottleReduce = flow.get("lastThrottleReduce") || 0;
+var nowMs = new Date().getTime();
+
+var mpptThrottling = (
+    SOC >= 100 &&
+    SungrowW > 500 &&
+    (mppt1W < 50 || mppt2W < 50 || mppt3W < 50)
+);
+
+if (mpptThrottling) {
+    throttleExport = Math.min(throttleExport + 100, SungrowW);
+} else if (SOC >= 100 && throttleExport > 0) {
+    if (nowMs - lastThrottleReduce > 10000) {
+        throttleExport = Math.max(0, throttleExport - 100);
+        flow.set("lastThrottleReduce", nowMs);
+    }
+} else if (SOC < 100) {
+    throttleExport = 0;
+}
+flow.set("throttleExtraExport", throttleExport);
+
+// [1.7.2] Šeštadienio balansavimo flagas
+var saturdayBalanceDone = flow.get("saturdayBalanceDone") || false;
+if (dayOfWeekNow !== 6 && dayOfWeekNow !== 0) {
+    flow.set("saturdayBalanceDone", false);
+    saturdayBalanceDone = false;
+}
+
+// DEBUG
+debug.version = "1.7.8";
+var dynamicShadowDebug = (flow.get("SolarTodayRemaining") || 0) * (1 - avgCorrectionFactor);
+debug.shadowCorrection = Math.max(5, dynamicShadowDebug);
+debug.avgCorrectionFactor = avgCorrectionFactor; // [1.7.8]
+debug.timestamp = new Date().toISOString();
+debug.TotalMPPTOutput = TotalMPPTOutput;
+debug.SOC = SOC;
+debug.ACC = ACC;
+debug.DCW = DCW;
+debug.correctionFactor = correctionFactor;
+debug.isCloudyTomorrow = isCloudyTomorrow;
+debug.BPW = BPW;
+debug.ForecasterBufferkWh_initial = ForecasterBufferkWh;
+debug.SolarTotalForecastToday = SolarTotalForecastToday;
+debug.SolarTodayRemaining = flow.get("SolarTodayRemaining") || 0;
+debug.BattPot = BattPot;
+debug.DC = DC;
+debug.DynamicAverageConsumptionW = flow.get("DynamicAverageConsumptionW") || 1000;
+debug.dynamicDayThreshold = dayThreshold;
+debug.sunsetHour = sunsetHour;
+debug.afternoonStartHour = afternoonStartHour;
+debug.targetSOC_at_14_received = targetSOC_at_14;
+debug.targetSOC_at_16_received = targetSOC_at_16;
+debug.activeTargetSOC = null;
+debug.adjustedBuffer = null;
+debug.targetDischargeSOC = null;
+debug.targetReason = null;
+debug.chargeMode = "";
+debug.dayOfWeek = dayOfWeekNow;
+debug.saturdayBalanceDone = saturdayBalanceDone;
+debug.BMS_CCL = flow.get("BMS_CCL");
+debug.mpptThrottling = mpptThrottling;
+debug.throttleExtraExport = throttleExport;
+debug.mppt1W = mppt1W;
+debug.mppt2W = mppt2W;
+debug.mppt3W = mppt3W;
+debug.SungrowW = SungrowW;
+
+// === 2. KONSTANTOS IR SISTEMOS SPECIFIKACIJOS ===
+const TOTAL_BATTERY_CAPACITY_KWH = 72.28;
+const SUNRISE_GENERATION_STARTS_HOUR = 9;
+const UNACCOUNTED_LOSSES_WATTS = 130;
+const MAX_BATTERY_CHARGE_RATE_DURING_PEAK_ADJUSTABLE_BY_FORECAST = 5000;
+const EARLY_MORNING_DISCHARGE_START_HOUR = 6;
+const EARLY_MORNING_DISCHARGE_END_HOUR = 9;
+const TARGET_EXPORT_POWER_DURING_MORNING_DISCHARGE = 3000;
+const MINIMUM_EXPORT_THRESHOLD_W = 400;
+const CHARGE_AGGRESSIVENESS_FACTOR = (currentMonth >= 8 || currentMonth <= 2) ? 1.5 : 1.25;
+const ABSORPTION_DURATION_HOURS = 1.5;
+const MAX_VOLTAGE = 56.8;
+const ABSORPTION_SURPLUS_THRESHOLD_W = 2000;
+
+// === 3. KODO ĮVYKDYMAS ===
+let actualMomentarySurplus = TotalMPPTOutput - ACC - DCW - UNACCOUNTED_LOSSES_WATTS;
+let earlyMorningDischargeActive = false;
+let exportAmount = 0;
+const isCloudyDayDetermined = (SolarTotalForecastToday < dayThreshold);
+const isSunnyDayDetermined = !isCloudyDayDetermined;
+
+// [1.7.8] adjustedBuffer naudoja avgCorrectionFactor
+let adjustedBuffer = ForecasterBufferkWh * avgCorrectionFactor;
+debug.adjustedBuffer = adjustedBuffer;
+
+let requiredDischargeKWh = Math.max(0, ForecasterBufferkWh - BattPot);
+let targetDischargeSOC = SOC - (requiredDischargeKWh / TOTAL_BATTERY_CAPACITY_KWH * 100);
+debug.targetDischargeSOC = targetDischargeSOC;
+
+// === PAGRINDINĖ LOGIKA ===
+let effectiveDayIsSunny = isSunnyDayDetermined;
+debug.initialDayType = isCloudyDayDetermined ? "Cloudy" : "Sunny";
+// Cloudy→Sunny naudoja momentinį correctionFactor
+if (currentHour >= 12 && isCloudyDayDetermined && correctionFactor > 1.5
+    && (flow.get("SolarTodayRemaining") || 0) > BattPot) {
+    effectiveDayIsSunny = true;
+}
+debug.effectiveDayType = effectiveDayIsSunny ? "Sunny" : "Cloudy";
+debug.dayTypeSwitched = debug.initialDayType !== debug.effectiveDayType;
+
+const absorptionActive = flow.get("absorptionPhaseActive") || false;
+const absorptionEndTime = flow.get("absorptionEndTime") || 0;
+let inAbsorptionPhase = false;
+
+if (absorptionActive && nowMs < absorptionEndTime) {
+    debug.mainLogicBranch = "Absorption Phase Active";
+    inAbsorptionPhase = true;
+
+    if (mpptThrottling || throttleExport > 0) {
+        reservedPowerLimit = Math.max(0, actualMomentarySurplus - throttleExport);
+        debug.chargeMode = mpptThrottling
+            ? "Absorption (MPPT Throttling Relief)"
+            : "Absorption (Throttle Reducing)";
+    } else {
+        reservedPowerLimit = 18000;
+        exportAmount = 0;
+        debug.chargeMode = "Absorption";
+    }
+} else if (absorptionActive) {
+    flow.set("absorptionPhaseActive", false);
+}
+
+if (inAbsorptionPhase) {
+} else if (DC >= MAX_VOLTAGE) {
+    reservedPowerLimit = 0;
+    debug.mainLogicBranch = "Safety Stop: Voltage limit exceeded";
+    debug.chargeMode = "Safety Stop (Overvoltage)";
+} else if (TotalMPPTOutput < 2000) {
+    reservedPowerLimit = 18000;
+    debug.mainLogicBranch = "Priority Charge: Low generation";
+    debug.chargeMode = "Priority Charge";
+} else if (ForecasterBufferkWh < 0) {
+    reservedPowerLimit = 0;
+    debug.mainLogicBranch = "Safety Stop: Error in buffer calculation";
+    debug.chargeMode = "Safety Stop (Buffer Error)";
+}
+else if (!effectiveDayIsSunny) {
+    debug.mainLogicBranch = "Entering Cloudy Day Logic";
+    if (SOC >= 99 && currentHour < afternoonStartHour) {
+        reservedPowerLimit = 0;
+        debug.chargeMode = "Cloudy: Export (SOC 99%)";
+    } else {
+        reservedPowerLimit = 18000;
+        debug.chargeMode = "Cloudy: Charging";
+    }
+}
+else if (effectiveDayIsSunny) {
+    if (currentHour >= EARLY_MORNING_DISCHARGE_START_HOUR && currentHour < EARLY_MORNING_DISCHARGE_END_HOUR) {
+        if (SOC > targetDischargeSOC) {
+            reservedPowerLimit = 0;
+            earlyMorningDischargeActive = true;
+            debug.mainLogicBranch = "Morning Discharge (Discharging)";
+            debug.chargeMode = "Morning Discharge";
+        } else {
+            reservedPowerLimit = 18000;
+            debug.mainLogicBranch = "Morning Discharge (Charging)";
+            debug.chargeMode = "Morning Charging";
+        }
+    }
+    else if (currentHour >= SUNRISE_GENERATION_STARTS_HOUR) {
+        if (SOC >= 99 && currentHour < afternoonStartHour) {
+            reservedPowerLimit = 0;
+            debug.mainLogicBranch = "Hard Ceiling: SOC at 99% before final charge";
+            debug.chargeMode = "Hard Ceiling 99% (Exporting)";
+        }
+        else if (currentHour >= afternoonStartHour && currentHour < sunsetHour) {
+            var finalChargeTarget = 99;
+            var chargeReason = "Soft-landing to 99%";
+
+            // [1.7.8] shadowCorrection naudoja avgCorrectionFactor
+            var dynamicShadow = (flow.get("SolarTodayRemaining") || 0) * (1 - avgCorrectionFactor);
+            var shadowCorrection = Math.max(5, dynamicShadow);
+            var solarTodayRemaining = Math.max(0, (flow.get("SolarTodayRemaining") || 0) - shadowCorrection);
+
+            var proactiveThreshold = Math.max(2, BattPot * 2);
+            if (solarTodayRemaining < proactiveThreshold && netEnergyForecast_18_19_Wh < 1000) {
+                finalChargeTarget = 100;
+                chargeReason = "Proactive MAX CHARGE (Remaining: " + solarTodayRemaining.toFixed(1) + "kWh, Threshold: " + proactiveThreshold.toFixed(1) + "kWh)";
+            }
+            else if (solarTodayRemaining > 0) {
+                var hoursToSunset = Math.max(0, sunsetHour - currentHour);
+                var avgConsumptionKWh = (flow.get("DynamicAverageConsumptionW") || 1500) / 1000;
+                var consumptionUntilSunset = hoursToSunset * avgConsumptionKWh;
+                var netSolarRemaining = Math.max(0, solarTodayRemaining - consumptionUntilSunset);
+                if (netSolarRemaining < BattPot * 1.2) {
+                    finalChargeTarget = 100;
+                    chargeReason = "MAX CHARGE (Net: " + netSolarRemaining.toFixed(1) + "kWh < BattPot×1.2: " + (BattPot * 1.2).toFixed(1) + "kWh)";
+                }
+                if (finalChargeTarget === 99 && isCloudyTomorrow) {
+                    finalChargeTarget = 100;
+                    chargeReason = "MAX CHARGE (Cloudy Tomorrow)";
+                }
+                if (finalChargeTarget === 99 && dayOfWeekNow === 0 && !saturdayBalanceDone) {
+                    finalChargeTarget = 100;
+                    chargeReason = "BALANCE CHARGE (Saturday missed)";
+                }
+                if (finalChargeTarget === 99 && dayOfWeekNow === 0 && saturdayBalanceDone) {
+                    chargeReason = "Standard 99% (Saturday balanced)";
+                }
+            }
+            else if (isCloudyTomorrow) {
+                finalChargeTarget = 100;
+                chargeReason = "MAX CHARGE (Cloudy Tomorrow)";
+            }
+            else if (dayOfWeekNow === 0 && !saturdayBalanceDone) {
+                finalChargeTarget = 100;
+                chargeReason = "BALANCE CHARGE (Saturday missed)";
+            }
+            else if (dayOfWeekNow === 0 && saturdayBalanceDone) {
+                chargeReason = "Standard 99% (Saturday balanced)";
+            }
+
+            debug.mainLogicBranch = "Entering Final Charge (" + chargeReason + ")";
+            debug.activeTargetSOC = finalChargeTarget;
+
+            if (SOC < finalChargeTarget) {
+                reservedPowerLimit = 18000;
+                debug.chargeMode = "Aggressive Final Charge";
+            } else {
+                debug.chargeMode = "Target Met or Exceeded";
+                reservedPowerLimit = 0;
+            }
+        }
+        else if (currentHour >= 14 && currentHour < afternoonStartHour) {
+            if (ForecasterBufferkWh > 3) {
+                debug.mainLogicBranch = "Entering Sunny 14-" + afternoonStartHour + "h block (Buffer Management)";
+                if (adjustedBuffer > BattPot) {
+                    reservedPowerLimit = 0;
+                    debug.chargeMode = "14h Buffer: Exporting (Buffer > BattPot)";
+                } else {
+                    if (SOC >= 99 && dayOfWeekNow !== 0) {
+                        reservedPowerLimit = 0;
+                        debug.mainLogicBranch = "Sunny 14-" + afternoonStartHour + "h: Hard Ceiling 99% (Buffer)";
+                        debug.chargeMode = "14h Buffer: Hard Ceiling 99%";
+                    } else {
+                        reservedPowerLimit = 18000;
+                        debug.chargeMode = "14h Buffer: Charging";
+                    }
+                }
+            } else {
+                debug.mainLogicBranch = "Entering Sunny 14-" + afternoonStartHour + "h block (Targeting)";
+                var maxDaySOC = (dayOfWeekNow === 0) ? 100 : 99;
+                // 14h Targeting naudoja momentinį correctionFactor
+                var targetSOC = Math.min((correctionFactor <= 0.5) ? 95 : targetSOC_at_16, maxDaySOC);
+                debug.activeTargetSOC = targetSOC;
+                if (SOC < targetSOC) {
+                    var targetEnergy_kWh = (targetSOC / 100) * TOTAL_BATTERY_CAPACITY_KWH;
+                    var currentEnergy_kWh = (SOC / 100) * TOTAL_BATTERY_CAPACITY_KWH;
+                    var energyNeeded_kWh = Math.max(0, targetEnergy_kWh - currentEnergy_kWh);
+                    var hoursRemaining = afternoonStartHour - (currentHour + currentMinutes / 60);
+                    var requiredChargePower_W = 18000;
+                    if (hoursRemaining > 0.01) {
+                        requiredChargePower_W = (energyNeeded_kWh / hoursRemaining) * 1000;
+                    }
+                    reservedPowerLimit = requiredChargePower_W * CHARGE_AGGRESSIVENESS_FACTOR;
+                    debug.chargeMode = "14h Targeting: Charging to " + targetSOC + "%";
+                } else {
+                    reservedPowerLimit = 0;
+                    debug.chargeMode = "14h Targeting: Target Met (Exporting)";
+                }
+            }
+        }
+        else if (currentHour >= SUNRISE_GENERATION_STARTS_HOUR && currentHour < 14) {
+            if (ForecasterBufferkWh <= 3) {
+                debug.mainLogicBranch = "Entering Sunny 9-14h block (Targeting " + targetSOC_at_14 + "%)";
+                var targetSOC14 = Math.min(targetSOC_at_14, 99);
+                debug.activeTargetSOC = targetSOC14;
+                if (SOC < targetSOC14) {
+                    var tE14 = (targetSOC14 / 100) * TOTAL_BATTERY_CAPACITY_KWH;
+                    var cE14 = (SOC / 100) * TOTAL_BATTERY_CAPACITY_KWH;
+                    var eN14 = Math.max(0, tE14 - cE14);
+                    var hR14 = 14 - (currentHour + currentMinutes / 60);
+                    var rCP14 = 18000;
+                    if (hR14 > 0.01) {
+                        rCP14 = (eN14 / hR14) * 1000;
+                    }
+                    reservedPowerLimit = rCP14;
+                    debug.chargeMode = "9-14h: Charging to " + targetSOC14 + "%";
+                } else {
+                    reservedPowerLimit = 0;
+                    debug.chargeMode = "9-14h: Target Met (Exporting)";
+                }
+            } else {
+                debug.mainLogicBranch = "Entering Sunny 9-14h block (Buffer Management)";
+                if (isCloudyTomorrow) {
+                    reservedPowerLimit = 18000;
+                    debug.chargeMode = "9-14h Buffer: Charging (Cloudy Tomorrow)";
+                } else {
+                    if (adjustedBuffer > BattPot) {
+                        reservedPowerLimit = 0;
+                        debug.chargeMode = "9-14h Buffer: Exporting (Buffer > BattPot)";
+                    } else if (adjustedBuffer < BattPot) {
+                        reservedPowerLimit = 18000;
+                        debug.chargeMode = "9-14h Buffer: Charging (BattPot > Buffer)";
+                    } else {
+                        var hR9 = 14 - (currentHour + currentMinutes / 60);
+                        if (hR9 > 0.01) {
+                            var bCP9 = (BattPot / hR9) * 1000;
+                            reservedPowerLimit = Math.min(bCP9, MAX_BATTERY_CHARGE_RATE_DURING_PEAK_ADJUSTABLE_BY_FORECAST);
+                        } else {
+                            reservedPowerLimit = 18000;
+                        }
+                        debug.chargeMode = "9-14h Buffer: Balanced Charging";
+                    }
+                }
+            }
+        }
+        else {
+            debug.mainLogicBranch = "After Sunset (Post " + sunsetHour + "h)";
+            var finalChargeTargetSunset = 100;
+            debug.activeTargetSOC = finalChargeTargetSunset;
+            if (SOC < finalChargeTargetSunset) {
+                reservedPowerLimit = 18000;
+                debug.chargeMode = "Night Charge to 100%";
+            } else {
+                reservedPowerLimit = 0;
+                debug.chargeMode = "Night: Full (100%)";
+            }
+        }
+    }
+    else {
+        debug.mainLogicBranch = "Before Sunrise (Pre 6h)";
+        reservedPowerLimit = 0;
+        debug.chargeMode = "Pre-Sunrise (Idle)";
+    }
+}
+
+// === Galutinis eksporto skaičiavimas ===
+if (!earlyMorningDischargeActive) {
+    var excessPower = actualMomentarySurplus - reservedPowerLimit;
+    excessPower = Math.max(0, excessPower);
+    exportAmount = Math.min(excessPower, GLimit);
+} else {
+    exportAmount = TARGET_EXPORT_POWER_DURING_MORNING_DISCHARGE;
+}
+
+if (exportAmount > 0 && exportAmount < MINIMUM_EXPORT_THRESHOLD_W) {
+    exportAmount = 0;
+}
+
+// [1.7.0] Absorpcijos fazės įjungimas
+var generationSurplus = TotalMPPTOutput - ACC;
+var lowSurplus = (generationSurplus < ABSORPTION_SURPLUS_THRESHOLD_W);
+var nearSunset = (currentHour >= (sunsetHour - 1));
+debug.absorptionSurplus = Math.round(generationSurplus);
+debug.absorptionLowSurplus = lowSurplus;
+debug.absorptionNearSunset = nearSunset;
+
+if (SOC >= 100 && !absorptionActive && (lowSurplus || nearSunset)) {
+    node.warn("Pradedama absorbcijos fazė. Surplus: " + Math.round(generationSurplus) + "W, nearSunset: " + nearSunset);
+    flow.set("absorptionPhaseActive", true);
+    var endTime = nowMs + (ABSORPTION_DURATION_HOURS * 60 * 60 * 1000);
+    flow.set("absorptionEndTime", endTime);
+    reservedPowerLimit = 18000;
+    exportAmount = 0;
+    debug.chargeMode = "Absorption (Just Started)";
+
+    if (dayOfWeekNow === 6) {
+        flow.set("saturdayBalanceDone", true);
+        saturdayBalanceDone = true;
+        node.warn("Šeštadienio balansavimas įvyko – sekmadienis taikys standartinę 99% logiką");
+    }
+}
+
+// === Pabaiga ===
+debug.exportAmount = exportAmount;
+debug.reservedPowerLimitFinal = reservedPowerLimit;
+debug.isSunnyDayDetermined = isSunnyDayDetermined;
+
+msg1.payload = exportAmount > 0 ? -1 * exportAmount : 0;
+msg1.debug = debug;
+
+flow.set("setpoint", exportAmount);
+flow.set("debug_export", debug);
+flow.set("reservedPowerLimit", reservedPowerLimit);
+
+return msg1;
